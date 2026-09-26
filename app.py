@@ -26,7 +26,8 @@ class BusinessError(Exception):
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    # 微秒精度：撤回后“重新表达意愿”等先后判断依赖时间戳可比较。
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class ReviewStore:
@@ -76,6 +77,10 @@ class ReviewStore:
                     reason TEXT NOT NULL,
                     created_by TEXT NOT NULL REFERENCES users(id),
                     created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','withdrawn')),
+                    withdraw_note TEXT,
+                    withdrawn_by TEXT REFERENCES users(id),
+                    withdrawn_at TEXT,
                     PRIMARY KEY (reviewer_id, paper_id)
                 );
                 CREATE TABLE IF NOT EXISTS bids (
@@ -91,12 +96,12 @@ class ReviewStore:
                     paper_id INTEGER NOT NULL REFERENCES papers(id),
                     reviewer_id TEXT NOT NULL REFERENCES users(id),
                     status TEXT NOT NULL DEFAULT 'invited'
-                        CHECK (status IN ('invited','accepted','declined','completed')),
+                        CHECK (status IN ('invited','accepted','declined','completed','cancelled')),
                     score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
                     review_text TEXT,
+                    excluded INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE (paper_id, reviewer_id)
+                    updated_at TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS rebuttals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,6 +127,50 @@ class ReviewStore:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (paper_id) REFERENCES papers(id)
                 );
+                """
+            )
+            self._migrate(conn)
+            # 同一评审人对同一论文只允许一条进行中的分配；已取消/已完成的留作档案，可再次邀请。
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS assignments_active_unique "
+                "ON assignments(paper_id, reviewer_id) WHERE status IN ('invited','accepted')"
+            )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """兼容旧版数据库：补冲突撤回字段、分配表 cancelled 状态与 excluded 标记。"""
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(conflicts)")}
+        if "status" not in cols:
+            conn.executescript(
+                """
+                ALTER TABLE conflicts ADD COLUMN status TEXT NOT NULL DEFAULT 'active';
+                ALTER TABLE conflicts ADD COLUMN withdraw_note TEXT;
+                ALTER TABLE conflicts ADD COLUMN withdrawn_by TEXT REFERENCES users(id);
+                ALTER TABLE conflicts ADD COLUMN withdrawn_at TEXT;
+                """
+            )
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='assignments'"
+        ).fetchone()
+        if row and "'cancelled'" not in row[0]:
+            # CHECK 与表级 UNIQUE 无法原地修改，重建 assignments 并保留历史行。
+            conn.executescript(
+                """
+                CREATE TABLE assignments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_id INTEGER NOT NULL REFERENCES papers(id),
+                    reviewer_id TEXT NOT NULL REFERENCES users(id),
+                    status TEXT NOT NULL DEFAULT 'invited'
+                        CHECK (status IN ('invited','accepted','declined','completed','cancelled')),
+                    score INTEGER CHECK (score IS NULL OR score BETWEEN 1 AND 5),
+                    review_text TEXT,
+                    excluded INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO assignments_new(id,paper_id,reviewer_id,status,score,review_text,excluded,created_at,updated_at)
+                    SELECT id,paper_id,reviewer_id,status,score,review_text,0,created_at,updated_at FROM assignments;
+                DROP TABLE assignments;
+                ALTER TABLE assignments_new RENAME TO assignments;
                 """
             )
 
@@ -203,9 +252,9 @@ class ReviewStore:
             else:
                 rows = conn.execute(
                     """SELECT p.* FROM papers p
-                       LEFT JOIN assignments a ON a.paper_id=p.id AND a.reviewer_id=?
-                       LEFT JOIN bids b ON b.paper_id=p.id AND b.reviewer_id=?
-                       WHERE a.id IS NOT NULL OR b.paper_id IS NOT NULL ORDER BY p.id""",
+                       WHERE EXISTS(SELECT 1 FROM assignments a WHERE a.paper_id=p.id AND a.reviewer_id=?)
+                          OR EXISTS(SELECT 1 FROM bids b WHERE b.paper_id=p.id AND b.reviewer_id=?)
+                       ORDER BY p.id""",
                     (user_id, user_id),
                 ).fetchall()
             return [self._paper_view(conn, row, user) for row in rows]
@@ -227,8 +276,11 @@ class ReviewStore:
                 raise BusinessError("作者只能查看自己的论文", 403, "forbidden")
             return self._paper_view(conn, paper, user)
 
+    # ---- 冲突档案：登记与查询（撤回规则见 withdraw_conflict，页面入口见 web/index.html） ----
+
     def add_conflict(self, chair_id: str, paper_id: int, reviewer_id: str, reason: str) -> dict:
-        if not reason.strip():
+        reason = reason.strip()
+        if not reason:
             raise BusinessError("利益冲突原因不能为空", 422, "invalid_reason")
         with self.connect() as conn:
             chair = self._user(conn, chair_id)
@@ -237,15 +289,114 @@ class ReviewStore:
                 raise BusinessError("论文不存在", 404, "not_found")
             reviewer = self._user(conn, reviewer_id)
             self._require(reviewer, "reviewer")
-            try:
-                conn.execute(
-                    "INSERT INTO conflicts(reviewer_id,paper_id,reason,created_by,created_at) VALUES(?,?,?,?,?)",
-                    (reviewer_id, paper_id, reason.strip(), chair_id, utcnow()),
-                )
-            except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT status FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)
+            ).fetchone()
+            if existing and existing["status"] == "active":
                 raise BusinessError("利益冲突已登记", 409, "conflict_exists")
-            self._audit(conn, paper_id, chair_id, "conflict.add", {"reviewer_id": reviewer_id, "reason": reason.strip()})
-            return {"paper_id": paper_id, "reviewer_id": reviewer_id, "reason": reason.strip()}
+            if existing:
+                # 已撤回的记录重新登记：覆盖为新的活动冲突，撤回信息清空（历史见审计日志）。
+                conn.execute(
+                    """UPDATE conflicts SET status='active',reason=?,created_by=?,created_at=?,
+                       withdraw_note=NULL,withdrawn_by=NULL,withdrawn_at=NULL
+                       WHERE reviewer_id=? AND paper_id=?""",
+                    (reason, chair_id, utcnow(), reviewer_id, paper_id),
+                )
+            else:
+                try:
+                    conn.execute(
+                        "INSERT INTO conflicts(reviewer_id,paper_id,reason,created_by,created_at) VALUES(?,?,?,?,?)",
+                        (reviewer_id, paper_id, reason, chair_id, utcnow()),
+                    )
+                except sqlite3.IntegrityError:
+                    raise BusinessError("利益冲突已登记", 409, "conflict_exists")
+            self._audit(conn, paper_id, chair_id, "conflict.add", {"reviewer_id": reviewer_id, "reason": reason})
+            return {"paper_id": paper_id, "reviewer_id": reviewer_id, "reason": reason}
+
+    def list_conflicts(self, chair_id: str, paper_id: int) -> list[dict]:
+        """冲突档案：含已撤回记录及登记/撤回双方的操作者、时间与说明。"""
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            if not conn.execute("SELECT 1 FROM papers WHERE id=?", (paper_id,)).fetchone():
+                raise BusinessError("论文不存在", 404, "not_found")
+            rows = conn.execute(
+                "SELECT * FROM conflicts WHERE paper_id=? ORDER BY created_at, reviewer_id", (paper_id,)
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    # ---- 撤回规则：纠正误登记，并同步处置关联邀请与评审 ----
+
+    def withdraw_conflict(self, chair_id: str, paper_id: int, reviewer_id: str, note: str) -> dict:
+        note = note.strip()
+        if not note:
+            raise BusinessError("撤回说明不能为空", 422, "invalid_note")
+        with self.connect() as conn:
+            chair = self._user(conn, chair_id)
+            self._require(chair, "chair")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
+                if not paper:
+                    raise BusinessError("论文不存在", 404, "not_found")
+                conflict = conn.execute(
+                    "SELECT * FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)
+                ).fetchone()
+                if not conflict:
+                    raise BusinessError("利益冲突记录不存在", 404, "not_found")
+                if conflict["status"] == "withdrawn":
+                    raise BusinessError("利益冲突已撤回", 409, "conflict_already_withdrawn")
+                now = utcnow()
+                # 论文已决定时只记录处置：不触碰邀请与评审，结论保持不变。
+                in_play = paper["status"] in {"submitted", "under_review"}
+                to_cancel, to_exclude = [], []
+                if in_play:
+                    to_cancel = [r["id"] for r in conn.execute(
+                        "SELECT id FROM assignments WHERE paper_id=? AND reviewer_id=? AND status='invited'",
+                        (paper_id, reviewer_id),
+                    )]
+                    to_exclude = [r["id"] for r in conn.execute(
+                        "SELECT id FROM assignments WHERE paper_id=? AND reviewer_id=? AND status='completed'",
+                        (paper_id, reviewer_id),
+                    )]
+                conn.execute(
+                    """UPDATE conflicts SET status='withdrawn',withdraw_note=?,withdrawn_by=?,withdrawn_at=?
+                       WHERE reviewer_id=? AND paper_id=?""",
+                    (note, chair_id, now, reviewer_id, paper_id),
+                )
+                self._audit(conn, paper_id, chair_id, "conflict.withdraw", {
+                    "reviewer_id": reviewer_id,
+                    "note": note,
+                    "paper_status": paper["status"],
+                    "cancelled_assignment_ids": to_cancel,
+                    "excluded_assignment_ids": to_exclude,
+                })
+                for assignment_id in to_cancel:
+                    conn.execute(
+                        "UPDATE assignments SET status='cancelled',updated_at=? WHERE id=?", (now, assignment_id)
+                    )
+                    self._audit(conn, paper_id, chair_id, "assignment.cancel",
+                                {"assignment_id": assignment_id, "reviewer_id": reviewer_id, "cause": "conflict_withdrawn"})
+                for assignment_id in to_exclude:
+                    # 已完成意见留在时间线，但标记为不再计入补位与决定。
+                    conn.execute(
+                        "UPDATE assignments SET excluded=1,updated_at=? WHERE id=?", (now, assignment_id)
+                    )
+                    self._audit(conn, paper_id, chair_id, "review.exclude",
+                                {"assignment_id": assignment_id, "reviewer_id": reviewer_id, "cause": "conflict_withdrawn"})
+                return {
+                    "paper_id": paper_id,
+                    "reviewer_id": reviewer_id,
+                    "status": "withdrawn",
+                    "withdraw_note": note,
+                    "withdrawn_by": chair_id,
+                    "withdrawn_at": now,
+                    "cancelled_assignment_ids": to_cancel,
+                    "excluded_assignment_ids": to_exclude,
+                }
+            except Exception:
+                conn.rollback()
+                raise
 
     def bid(self, reviewer_id: str, paper_id: int, interest: str, note: str = "") -> dict:
         if interest not in {"want", "maybe", "decline"}:
@@ -256,7 +407,7 @@ class ReviewStore:
             paper = conn.execute("SELECT status FROM papers WHERE id=?", (paper_id,)).fetchone()
             if not paper or paper["status"] not in {"submitted", "under_review"}:
                 raise BusinessError("论文不存在或当前不可表达意向", 409, "paper_unavailable")
-            if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
+            if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=? AND status='active'", (reviewer_id, paper_id)).fetchone():
                 raise BusinessError("存在利益冲突，不能表达评审意向", 409, "conflict_of_interest")
             conn.execute(
                 """INSERT INTO bids(reviewer_id,paper_id,interest,note,created_at) VALUES(?,?,?,?,?)
@@ -277,8 +428,21 @@ class ReviewStore:
                     raise BusinessError("论文不存在或不可分配", 409, "paper_unavailable")
                 reviewer = self._user(conn, reviewer_id)
                 self._require(reviewer, "reviewer")
-                if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=?", (reviewer_id, paper_id)).fetchone():
+                if conn.execute("SELECT 1 FROM conflicts WHERE reviewer_id=? AND paper_id=? AND status='active'", (reviewer_id, paper_id)).fetchone():
                     raise BusinessError("评审人与论文存在利益冲突", 409, "conflict_of_interest")
+                withdrawn = conn.execute(
+                    "SELECT withdrawn_at FROM conflicts WHERE reviewer_id=? AND paper_id=? AND status='withdrawn'",
+                    (reviewer_id, paper_id),
+                ).fetchone()
+                if withdrawn:
+                    # 冲突撤回后，评审人须重新表达意愿（撤回时间之后的 want/maybe 意向）才可再被邀请。
+                    willing = conn.execute(
+                        """SELECT 1 FROM bids WHERE reviewer_id=? AND paper_id=?
+                           AND interest IN ('want','maybe') AND created_at>?""",
+                        (reviewer_id, paper_id, withdrawn["withdrawn_at"]),
+                    ).fetchone()
+                    if not willing:
+                        raise BusinessError("冲突撤回后，评审人需重新表达评审意愿才能被邀请", 409, "willingness_required")
                 load = conn.execute(
                     "SELECT COUNT(*) FROM assignments WHERE reviewer_id=? AND status IN ('invited','accepted')",
                     (reviewer_id,),
@@ -307,6 +471,8 @@ class ReviewStore:
             row = conn.execute("SELECT * FROM assignments WHERE id=?", (assignment_id,)).fetchone()
             if not row or row["reviewer_id"] != reviewer_id:
                 raise BusinessError("分配不存在或不属于当前评审人", 404, "not_found")
+            if row["status"] == "cancelled":
+                raise BusinessError("邀请已被取消", 409, "invitation_cancelled")
             if row["status"] != "invited":
                 raise BusinessError("邀请已经处理", 409, "invitation_already_answered")
             status = "accepted" if accepted else "declined"
@@ -343,7 +509,7 @@ class ReviewStore:
             paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
             if not paper or paper["author_id"] != author_id:
                 raise BusinessError("论文不存在或不属于当前作者", 404, "not_found")
-            completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+            completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed' AND excluded=0", (paper_id,)).fetchone()[0]
             if completed < 1:
                 raise BusinessError("至少收到一份完整评审后才能提交 Rebuttal", 409, "reviews_not_ready")
             try:
@@ -367,7 +533,7 @@ class ReviewStore:
                 paper = conn.execute("SELECT * FROM papers WHERE id=?", (paper_id,)).fetchone()
                 if not paper or paper["status"] not in {"submitted", "under_review"}:
                     raise BusinessError("论文不存在或已经决定", 409, "paper_decided")
-                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed'", (paper_id,)).fetchone()[0]
+                completed = conn.execute("SELECT COUNT(*) FROM assignments WHERE paper_id=? AND status='completed' AND excluded=0", (paper_id,)).fetchone()[0]
                 if completed < 2:
                     raise BusinessError("至少需要两份已完成评审才能作出决定", 409, "insufficient_reviews")
                 cur = conn.execute(
@@ -443,9 +609,14 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[3] == "bids" and method == "POST":
                 data = self._body()
                 return self._send(201, store.bid(self._user_id(), paper_id, data.get("interest", ""), data.get("note", "")))
+            if len(parts) == 4 and parts[3] == "conflicts" and method == "GET":
+                return self._send(200, {"items": store.list_conflicts(self._user_id(), paper_id)})
             if len(parts) == 4 and parts[3] == "conflicts" and method == "POST":
                 data = self._body()
                 return self._send(201, store.add_conflict(self._user_id(), paper_id, data.get("reviewer_id", ""), data.get("reason", "")))
+            if len(parts) == 5 and parts[3] == "conflicts" and parts[4] == "withdraw" and method == "POST":
+                data = self._body()
+                return self._send(200, store.withdraw_conflict(self._user_id(), paper_id, data.get("reviewer_id", ""), data.get("note", "")))
             if len(parts) == 4 and parts[3] == "assignments" and method == "POST":
                 data = self._body()
                 return self._send(201, store.assign(self._user_id(), paper_id, data.get("reviewer_id", "")))
