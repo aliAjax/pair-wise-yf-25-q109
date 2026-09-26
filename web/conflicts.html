@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>冲突档案与撤回</title>
+<style>body{font:16px system-ui;max-width:900px;margin:32px auto;padding:0 16px}input,textarea,select,button{font:inherit;padding:8px;margin:4px}.panel{border:1px solid #bbb;padding:16px;border-radius:8px;margin-bottom:16px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style></head>
+<body><h1>冲突档案与撤回</h1>
+<p>本页面面向主席（chair）：登记利益冲突、查看冲突档案、撤回误登记的冲突。撤回需填写说明；论文已决定时仅记录处置，不改变结论。<a href="/">返回评审主页</a></p>
+<section class="panel"><h2>身份与论文</h2>
+<select id="user"><option>chair</option><option>alice</option><option>bob</option><option>r1</option><option>r2</option><option>r3</option></select>
+<input id="paper" type="number" min="1" placeholder="论文 ID">
+<button onclick="loadArchive()">查看冲突档案</button></section>
+<section class="panel"><h2>登记冲突</h2>
+<input id="cReviewer" placeholder="评审人 ID，如 r1"><input id="cReason" placeholder="冲突原因">
+<button onclick="addConflict()">登记</button></section>
+<section class="panel"><h2>撤回冲突</h2>
+<input id="wReviewer" placeholder="评审人 ID，如 r1"><input id="wNote" placeholder="撤回说明（必填）">
+<button onclick="withdrawConflict()">撤回</button></section>
+<section class="panel"><h2>结果与档案</h2><pre id="out">尚未查询</pre></section>
+<script>
+const headers={"Content-Type":"application/json","X-User-Id":"chair"};
+document.querySelector("#user").onchange=e=>headers["X-User-Id"]=e.target.value;
+async function api(url,opt={}){const r=await fetch(url,{...opt,headers});return await r.json()}
+function show(v){out.textContent=JSON.stringify(v,null,2)}
+async function loadArchive(){show(await api(`/api/papers/${paper.value}/conflicts`))}
+async function addConflict(){show(await api(`/api/papers/${paper.value}/conflicts`,{method:"POST",body:JSON.stringify({reviewer_id:cReviewer.value,reason:cReason.value})}))}
+async function withdrawConflict(){show(await api(`/api/papers/${paper.value}/conflicts/withdraw`,{method:"POST",body:JSON.stringify({reviewer_id:wReviewer.value,note:wNote.value})}))}
+</script></body></html>
